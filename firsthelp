@@ -1,0 +1,603 @@
+import datetime
+import logging.config
+import os
+import shutil
+import json
+from time import sleep, time
+
+import pyautogui
+
+import mss
+import mss.tools
+
+import config
+from utils import common
+from utils import telegram, mongo_client as mc
+import sys
+
+pyautogui.FAILSAFE = False
+
+logging.config.fileConfig(fname=f'poker_log.conf')
+LOG = logging.getLogger()
+
+taskkill_name = 'PokerStars.exe'
+app_path = "C:\Program Files (x86)\PokerStars\PokerStarsUpdate.exe"
+
+# data_type_coords = {'id_text': lambda: (19, 3, 191, 21),
+#                     'name_long': lambda: (136, 36, 966, 66),
+#                     'name_short': lambda: (189, 34, 448, 64),
+#                     'register_time_text': lambda: (172, 83, 441, 109),
+#                     'buy_in': lambda: (1128, 114, 1179, 139),
+#                     'prize': lambda: (602, 171, 705, 219),
+#                     'player_blind_chips': lambda: (5, 175, 601, 445)
+#                     }
+data_type_coords = [
+    {
+        "label": "id_text",
+        "coords": lambda: (19, 3, 191, 21),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20,
+        'invert': False
+    },
+    {
+        "label": "name",
+        "coords": lambda: (140, 30, 966, 66),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20
+    },
+    # {
+    #     "label": "name_short",
+    #     "coords": lambda: (189, 34, 448, 64),
+    #     "resize_factor": 325,
+    #     "alpha": 0.2,
+    #     "beta": 20
+    # },
+    {
+        "label": "register_time_text",
+        "coords": lambda: (172, 83, 441, 109),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20
+    },
+    {
+        "label": "buy_in",
+        "coords": lambda: (1128, 90, 1180, 139),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20
+    },
+    {
+        "label": "prize",
+        "coords": lambda: (602, 171, 705, 219),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20
+    },
+    {
+        "label": "player_blind_chips",
+        "coords": lambda: (1, 165, 601, 600),
+        "resize_factor": 325,
+        "alpha": 0.2,
+        "beta": 20
+
+    }
+]
+
+
+def get_locator_center():
+    location = pyautogui.locateOnScreen('pokerstars/locator.png', confidence=0.7)
+    cx, cy = pyautogui.center(location)
+    cx = int(str(cx))
+    cy = int(str(cy))
+    return cx, cy
+
+
+def get_login_locator_center():
+    try:
+        location = pyautogui.locateOnScreen('pokerstars/locator_login.png', confidence=0.7)
+        cx, cy = pyautogui.center(location)
+        cx = int(str(cx))
+        cy = int(str(cy))
+        return cx, cy
+    except:
+        return None, None
+
+
+def get_cashier_locator_center():
+    try:
+        location = pyautogui.locateOnScreen('pokerstars/cashier_locator.png', confidence=0.7)
+        cx, cy = pyautogui.center(location)
+        cx = int(str(cx))
+        cy = int(str(cy))
+        return cx, cy
+    except:
+        return None, None
+
+
+def get_image_location_str(counter, text):
+    return f'images/{counter}_{text}.png'
+
+
+def take_image(tx, ty, bx, by, image_path):
+    # pyautogui.screenshot(image_path, region=(tx, ty, bx - tx, by - ty))
+    with mss.mss() as sct:
+        region = {'left': tx, 'top': ty, 'width': bx - tx, 'height': by - ty}
+        img = sct.grab(region)
+        mss.tools.to_png(img.rgb, img.size, output=image_path)
+
+
+def get_remaining_players(player_blind_chips_text: str):
+    try:
+        indx = player_blind_chips_text.index('Remaining players:') + len('Remaining players:')
+    except ValueError:
+        return None, 'Player: Index not found for Remaining players'
+    sub_txt = player_blind_chips_text[indx:indx + 20]
+
+    of_variations = ['.of', '-of', '0f', 'af', 'of']
+
+    for of_var in of_variations:
+        try:
+            indx = sub_txt.index(of_var)
+            if indx < 10:
+                sub_txt = sub_txt.replace(of_var, ' of')
+                break
+        except:
+            continue
+
+    tokens = sub_txt.split()
+    if len(tokens) >= 3:
+
+        entrants = tokens[2].replace(',', '')
+        remaining = tokens[0].replace(',', '')
+
+        if entrants.isdigit() and remaining.isdigit():
+            entrants = int(entrants)
+            remaining = int(remaining)
+            if remaining <= entrants:
+                perc = int((remaining / entrants) * 100)
+                return [remaining, entrants, perc], None
+            else:
+                return None, 'Player: remaining is great entrants'
+
+    return None, 'Player: unknown format'
+
+
+def get_stating_chips(player_blind_chips_text: str):
+    try:
+        indx = player_blind_chips_text.index('Starting chips:') + len('Starting chips:')
+    except ValueError:
+        return None, 'Stating chips: Index not found for Starting chips'
+    sub_txt = player_blind_chips_text[indx:indx + 10]
+    tokens = sub_txt.split()
+
+    if len(tokens) >= 1:
+        num_1 = tokens[0].replace(',', '')
+        if num_1.isdigit():
+            return int(num_1), None
+
+    return None, 'Stating chips: unknown format'
+
+
+def get_blinds(player_blind_chips_text: str):
+    words = ['blinds', 'Button Blind', 'stakes']
+    indx = None
+    for word in words:
+        if word in player_blind_chips_text:
+            indx = player_blind_chips_text.index(word) + len(word)
+            break
+
+    if not indx:
+        return None, 'Blinds: Index not found for blind'
+
+    sub_txt = player_blind_chips_text[indx:indx + 20]
+    tokens = sub_txt.split()
+
+    # if len(tokens) >= 1 and '/' in tokens[0]:
+    if len(tokens) >= 1:
+        num_1 = None
+        if '/' in tokens[0]:
+            num_1 = tokens[0].split('/')[0]
+            num_2 = tokens[0].split('/')[1]
+        else:
+            num_2 = tokens[0]
+
+        num_2 = num_2.replace('ante', '')
+
+        if num_1 and 'K' in num_1:
+            num_1 = num_1.replace('K', '')
+            if num_1.isdigit():
+                num_1 = str(int(num_1) * 1000)
+
+        if num_2 and 'K' in num_2:
+            num_2 = num_2.replace('K', '')
+            if num_2.isdigit():
+                num_2 = str(int(num_2) * 1000)
+
+        if num_2.isdigit():
+
+            if int(num_2) == 0:
+                return None, 'Blinds: big blind 0'
+
+            if num_1:
+                data = f'{num_1}/{num_2}'
+            else:
+                data = f'{num_2}'
+            return data, None
+
+    return None, 'Blinds: unknown format'
+
+
+def get_id(id_text):
+    id_text = id_text.split()
+
+    if len(id_text) >= 2 and id_text[1].isdigit():
+        return f"ps_{id_text[1].strip()}", None
+
+    return None, 'ID: Unknown format'
+
+
+def get_register_time(register_time_text, capture_time):
+    # register_time_text.replace("$", '3').replace('&', '6')
+
+    register_time_text = register_time_text.replace("$", '3').replace('&', '8')
+
+    register_time_text = "".join(register_time_text.split()).lower()
+
+    if 'min' in register_time_text:
+        register_time_text = register_time_text[0:register_time_text.index('min') + 3]
+    else:
+        return None, 'Register Time: min word not present'
+
+    late_text_list = ['lateregistrationendsin',
+                      'lateregistrationandsin', 'latereglatrationendsin', 'latereglatrationendswithin',
+                      'lateregistrationendswithin',
+                      'lateregistrationandswithin', ]
+
+    def late_text_present(ends, witin):
+        if ends:
+            for t in late_text_list:
+                if 'within' not in register_time_text and t in register_time_text:
+                    return True
+            return False
+
+        if witin:
+            for t in late_text_list:
+                if 'within' in register_time_text and t in register_time_text:
+                    return True
+            return False
+
+    def replace_late_text(actual_text):
+        for t in late_text_list:
+            actual_text = actual_text.replace(t, '')
+        return actual_text
+
+    if late_text_present(True, False):
+        # for ends in
+        register_time_text = replace_late_text(register_time_text)
+
+        hour = 0
+        if 'h' in register_time_text:
+            time_token = register_time_text.split('h')
+            if time_token[0].isdigit():
+                hour = int(time_token[0])
+                if len(time_token) > 1:
+                    register_time_text = time_token[1]
+            else:
+                return None, 'Register Time: Hour not a digit'
+
+        if 'min' in register_time_text:
+            time_text = register_time_text.replace('min', '')
+            if time_text.isdigit():
+                mins = int(time_text)
+                register_time = capture_time + datetime.timedelta(
+                    minutes=hour * 60 + mins)
+                return register_time, None
+
+    elif late_text_present(False, True):
+        # login for within
+        register_time_text = replace_late_text(register_time_text)
+        if 'min' in register_time_text:
+            time_text = register_time_text.replace('min', '')
+            if time_text.isdigit():
+                register_time = capture_time + datetime.timedelta(
+                    seconds=45)  # something less than a minute
+                return register_time, None
+
+    return None, 'Register Time: Unknown time format'
+
+
+def get_name(name):
+    if not name:
+        return None, 'Name: Cannot be found'
+
+    return name,None
+
+
+def get_buyin(buyin_text):
+    data = buyin_text.strip()
+    if '$' not in data:
+        return None, 'Buy-in: $ not found'
+
+    data = data[data.index("$") + 1:].strip()
+    try:
+        data = float(data)
+        return data, None
+    except:
+        return None, 'Buy-in: Format not valid float'
+
+
+def get_prize(prize_text: str):
+    if not prize_text:
+        return None, 'Prize: Not found'
+
+    if '$' not in prize_text:
+        return None, 'Prize: $ found'
+
+    try:
+        data = prize_text[prize_text.index('$') + 1:]
+        data = data.replace(',', '').strip()
+
+        data = float(data)
+        return data, None
+    except:
+        return None, 'Prize: Format not valid float'
+
+
+def process_extracted_data(data_dict: dict, capture_time: datetime.datetime):
+    errors = []
+    # data_dict = common.image_to_text(data_image_paths, no_resize_keys=['name', 'player_blind_chips'],
+    #                                  no_invert_keys=['id_text'])
+
+    try:
+
+        tid, error = get_id(data_dict.get('id_text'))
+        data_dict['id'] = tid
+        if error:
+            errors.append(error)
+
+        name, name_error = get_name(data_dict.get('name'))
+        data_dict['name'] = name
+        if name_error:
+            errors.append(name_error)
+
+        register_time, error = get_register_time(data_dict.get('register_time_text'), capture_time)
+        data_dict['register_time'] = register_time
+        if error:
+            errors.append(error)
+
+        players_data, players_error = get_remaining_players(data_dict.get("player_blind_chips"))
+        data_dict['remaining_player'] = players_data
+        if isinstance(players_data, list) and len(players_data) == 3:
+            perc = players_data[2]
+            data_dict['remaining_player_percentage'] = perc
+        if players_error:
+            errors.append(players_error)
+
+        buy_in, buy_in_error = get_buyin(data_dict.get('buy_in'))
+        data_dict['buy_in'] = buy_in
+        if buy_in_error:
+            errors.append(buy_in_error)
+
+        prize, prize_error = get_prize(data_dict.get('prize'))
+        data_dict['prize'] = prize
+        if prize_error:
+            errors.append(prize_error)
+
+        blinds, blind_error = get_blinds(data_dict.get("player_blind_chips"))
+        data_dict['blinds'] = blinds
+        if blind_error:
+            errors.append(blind_error)
+
+        chips, chips_error = get_stating_chips(data_dict.get("player_blind_chips"))
+        data_dict['starting_chips'] = chips
+        if chips_error:
+            errors.append(chips_error)
+
+        if not blind_error and not chips_error:
+            e_stack = chips / int(blinds.split('/')[1]) if '/' in blinds else chips / int(blinds)
+            data_dict['effective_stack'] = round(e_stack, 2)
+
+        if not buy_in_error and not prize_error and not players_error and not name_error:
+            if 'phase1' not in "".join(name.lower().split()):
+                overlay = None
+                if isinstance(players_data, list) and len(players_data) == 3:
+                    registered = players_data[1]
+                    overlay = round(prize - buy_in * registered, 2)
+
+                data_dict['overlay'] = overlay
+
+        data_dict.update({'source': 'PokerStars', 'event_type': 'late_registration', 'captured_time': capture_time})
+
+        if errors:
+            data_dict['errors'] = errors
+
+        return data_dict
+    except:
+        LOG.error(f'Error Data:\n{json.dumps(data_dict, indent=2)}')
+        raise
+
+
+def get_locator_coordinates():
+    cx, cy = None, None
+    tried_counter = 0
+    while not cx and not cy:
+        if tried_counter == 8:
+            return None, None, tried_counter
+        try:
+            cx, cy = get_locator_center()
+            return cx, cy, tried_counter
+        except:
+            # return None, None
+            pass
+        tried_counter += 1
+
+
+def is_event_bounty(event_data):
+    name = event_data.get('name')
+    if name and 'progressiveko' in ''.join(name).lower():
+        return True
+
+    return False
+
+
+def close_lobby_window():
+    loc_x, loc_y = None, None
+    try:
+        loc_x, loc_y = get_locator_center()
+        trace_mouse(loc_x, loc_y)
+    except:
+        pass
+
+    if loc_x and loc_y and loc_x > 1150 and loc_y < 75:
+        x, y = 1257, 9
+        trace_mouse(x, y)
+        pyautogui.click(x, y)
+        sleep(1)
+        return True
+    return False
+
+
+def trace_mouse(x, y):
+    if len(sys.argv) > 1 and '-tm' in sys.argv:
+        pyautogui.moveTo(x, y)
+        pyautogui.alert(text=f'Mouse at: {x},{y}')
+
+
+def maximize_lobby_window(cx, cy):
+    x, y = cx + 10, cy - 44
+    trace_mouse(x, y)
+    pyautogui.click(x, y)
+    sleep(1)
+
+
+def get_all_images(images_coords_dataset, counter):
+    data_images_input = []
+    for image_coord_data in images_coords_dataset:
+        label = image_coord_data.get('label')
+        resize_factor = image_coord_data.get('resize_factor', 0)
+        coords = image_coord_data.get('coords')
+        threshold = image_coord_data.get('threshold', False)
+        invert = image_coord_data.get('invert', True)
+        alpha = image_coord_data.get('alpha', 0)
+        beta = image_coord_data.get('beta', 0)
+
+        image_path = get_image_location_str(counter, label)
+        take_image(*coords(), image_path)
+
+        image_data = {'label': label,
+                      'resize_factor': resize_factor,
+                      'threshold': threshold, 'invert': invert, 'image_path': image_path, 'alpha': alpha, 'beta': beta}
+
+        data_images_input.append(image_data)
+
+    return data_images_input
+
+
+def run():
+    previous_ids = []
+    counter = 1
+    last_login_check_time = time() - 3700
+    locator_not_found_count = 0
+    while True:
+
+        if locator_not_found_count > 20:
+            telegram.send_msg_seq(config.telegram_support_chat_id,
+                                  'Locator not found for a while. Please check the Pokerstars late register script.')
+            locator_not_found_count = 0  # so that tele msg is sent after some time.
+
+        start = time()
+        if counter == 1:
+            shutil.rmtree('images')
+            os.mkdir('images')
+            x, y = 52, 259
+            pyautogui.doubleClick(x=x, y=y)
+        else:
+            pyautogui.press(['down'])
+            sleep(.1)
+            pyautogui.press('enter')
+
+        cx, cy, tried_counter = get_locator_coordinates()
+
+        if not cx and not cy:
+            if time() - last_login_check_time >= 3600:
+                login_cx, login_cy = get_login_locator_center()
+                if login_cx and login_cy:
+                    LOG.info('Login screen found')
+                    pyautogui.hotkey('altleft', 'f4')  # close focused login window
+                    sleep(1)
+                    last_login_check_time = time()
+
+            LOG.error('Locator not found')
+            locator_not_found_count += 1
+
+            continue
+
+        locator_not_found_count = 0
+        LOG.info(f'Locator found after {tried_counter} tries')
+
+        maximize_lobby_window(cx, cy)
+
+        # data_image_paths = {}
+        # capture_time = datetime.datetime.utcnow()
+        # for attr_type, coor in data_type_coords.items():
+        #     image_path = get_image_location_str(counter, attr_type)
+        #     take_image(*coor(), image_path)
+        #     data_image_paths.update({attr_type: image_path})
+
+        capture_time = datetime.datetime.utcnow()
+        data_images_input = get_all_images(data_type_coords, counter)
+
+        LOG.debug(f'Images paths:\n{common.get_json_string(data_images_input)}')
+
+        start_image_p = time()
+
+        data_dict = common.image_to_text(data_images_input)
+        event_data = process_extracted_data(data_dict, capture_time)
+
+        LOG.debug(f'Time taken for image processing {counter}: {time() - start_image_p} secs')
+
+        LOG.info(f'Final data for counter {counter}:\n{common.get_json_string(event_data)}')
+
+        is_bounty = is_event_bounty(event_data)
+
+        if not is_bounty:
+            mc.insert_or_update_poker_event(event_data)
+
+        # close window
+        lobby_closed = close_lobby_window()
+        if not lobby_closed:
+            LOG.error('Lobby window not closed. Please check manually')
+
+        if event_data and event_data.get('id') and event_data.get('id').isdigit():
+            new_id = event_data.get('id')
+
+            if len(previous_ids) > 1:
+                last_ids = list(set(previous_ids[-2:-1]))
+                if len(last_ids) == 1 and new_id == last_ids[0]:
+                    LOG.info(f'Restating after counter {counter}, Last ID: {new_id}')
+                    for i in range(0, counter):
+                        pyautogui.press('up')
+                    counter = 1
+                    previous_ids = []
+                    continue
+
+            previous_ids.append(new_id)
+
+        LOG.info(f'Time taken for counter {counter}: {time() - start} secs')
+        counter += 1
+
+
+if __name__ == '__main__':
+    try:
+
+        if not os.path.exists('images'):
+            os.mkdir('images')
+
+        # before running, set filter in pokerstars with all variants except knockout
+        run()
+    except Exception as e:
+        LOG.exception('Error with pokerstars')
+        telegram.send_msg_seq(config.telegram_support_chat_id, f'Error with pokerstars\n{str(e)}')
+        raise
